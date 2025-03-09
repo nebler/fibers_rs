@@ -1,44 +1,105 @@
-use core::arch::asm;
+#![feature(naked_functions)]
+use std::arch::asm;
+const DEFAULT_STACK_SIZE: usize = 1024 * 1024 * 2;
+const MAX_THREADS: usize = 4;
+static mut RUNTIME: usize = 0;
 
-const SSIZE: isize = 48; // try out 624?
+pub struct Runtime {
+    threads: Vec<Thread>,
+    current: usize,
+}
 
+#[derive(PartialEq, Eq, Debug)]
+enum State {
+    Available,
+    Running,
+    Ready,
+}
+struct Thread {
+    stack: Vec<u8>,
+    ctx: ThreadContext,
+    state: State,
+}
 #[derive(Debug, Default)]
 #[repr(C)]
 struct ThreadContext {
     rsp: u64,
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbx: u64,
+    rbp: u64,
 }
 
-fn hello() -> ! {
-    println!("I LOVE WAKING UP ON A NEW STACK!");
-    loop {}
-}
-fn gt_switch(new: *const ThreadContext) {
-    // Move what’s at the + 0x00 offset from the memory location that {compiler_chosen_general_purpose_register} points to to the rsp register.
-    unsafe {
-        asm!(
-        "mov rsp, [{0} + 0x00]",
-        "ret",
-        in(reg) new,
-        )
+impl Thread {
+    fn new() -> Self {
+        Thread {
+            stack: vec![0_u8; DEFAULT_STACK_SIZE],
+            ctx: ThreadContext::default(),
+            state: State::Available,
+        }
     }
 }
 
-fn main() {
-    let mut ctx = ThreadContext::default();
-    let mut stack = vec![0_u8; SSIZE as usize];
-    unsafe {
-        let stack_bottom = stack.as_mut_ptr().offset(SSIZE);
-        let sb_aligned = (stack_bottom as usize & !15) as *mut u8;
-        std::ptr::write(sb_aligned.offset(-16) as *mut u64, hello as u64);
-        ctx.rsp = sb_aligned.offset(-16) as u64;
-
-        for i in 0..SSIZE {
-            println!(
-                "mem: {}, val: {}",
-                sb_aligned.offset(-i as isize) as usize,
-                *sb_aligned.offset(-i as isize)
-            )
+impl Runtime {
+    pub fn new() -> Self {
+        let base_thread = Thread {
+            stack: vec![0_u8; DEFAULT_STACK_SIZE],
+            ctx: ThreadContext::default(),
+            state: State::Running,
+        };
+        let mut threads = vec![base_thread];
+        let mut available_threads: Vec<Thread> = (1..MAX_THREADS).map(|_| Thread::new()).collect();
+        threads.append(&mut available_threads);
+        Runtime {
+            threads,
+            current: 0,
         }
-        gt_switch(&mut ctx);
+    }
+
+    pub fn init(&self) {
+        unsafe {
+            let r_ptr: *const Runtime = self;
+            RUNTIME = r_ptr as usize;
+        }
+    }
+
+    pub fn run(&mut self) -> ! {
+        while self.t_yield() {}
+        std::process::exit(0);
+    }
+
+    fn t_return(&mut self) {
+        if self.current != 0 {
+            self.threads[self.current].state = State::Available;
+            self.t_yield();
+        }
+    }
+
+    #[inline(never)]
+    fn t_yield(&mut self) -> bool {
+        let mut pos = self.current;
+        while self.threads[pos].state != State::Ready {
+            pos += 1;
+            if pos == self.threads.len() {
+                pos = 0;
+            }
+            if pos == self.current {
+                return false;
+            }
+        }
+        if self.threads[self.current].state != State::Available {
+            self.threads[self.current].state = State::Ready;
+        }
+        self.threads[pos].state = State::Running;
+        let old_pos = self.current;
+        self.current = pos;
+        unsafe {
+            let old: *mut ThreadContext = &mut self.threads[old_pos].ctx;
+            let new: *const ThreadContext = &self.threads[pos].ctx;
+            asm!("call switch", in("rdi") old, in("rsi") new, clobber_abi("C"));
+        }
+        self.threads.len() > 0
     }
 }
